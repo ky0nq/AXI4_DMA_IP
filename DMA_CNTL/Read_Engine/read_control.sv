@@ -18,7 +18,7 @@ module read_control #(
     input  logic                   r_hs,
     input  logic                   xfer_done,
     input  logic [1:0]             rresp,
-    input  logic [ADDR_WIDTH-1:0]  araddr,   // Error -> Where? 
+    input  logic [ADDR_WIDTH-1:0]  err_addr,   // Error -> Where? 
 
     // Datapath control signal
     output logic                   en,       // state == S_DATA
@@ -35,7 +35,7 @@ module read_control #(
     assign en = (state == S_DATA); 
 
     // state register
-    always_ff @(posedge clk or negedge rst_n) begin
+    always_ff @(posedge clk) begin
         if (!rst_n) begin
             state <= S_IDLE;
             init  <= 1'b0;
@@ -55,7 +55,7 @@ module read_control #(
         end
     end
 
-    always_ff @(posedge clk or negedge rst_n) begin
+    always_ff @(posedge clk) begin
         if (!rst_n) begin
             busy       <= 1'b0;
             done       <= 1'b0;
@@ -70,11 +70,11 @@ module read_control #(
             end
         end 
         else begin 
-            if (r_hs && (rresp != 2'b00) && !error) begin   // handshake done -> error exists 
+            if (r_hs && (rresp != 2'b00) && !error) begin             // handshake done -> error exists 
                 error      <= 1'b1;
-                error_addr <= {{(32-ADDR_WIDTH){1'b0}}, araddr};    // error address latch
+                error_addr <= {{(32-ADDR_WIDTH){1'b0}}, err_addr};    // error address latch
             end
-            if (xfer_done) begin                            // handshake done -> done signal 
+            if (xfer_done) begin                                      // handshake done -> done signal 
                 busy <= 1'b0;
                 done <= 1'b1;
             end
