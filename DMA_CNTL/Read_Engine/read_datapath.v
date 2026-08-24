@@ -78,10 +78,10 @@ module read_datapath #(
     reg  [LEN_WIDTH-1:0]  req_byte_cnt;     // request byte
     reg  [LEN_WIDTH-1:0]  total_byte_cnt;   // total received byte
 
-    reg  [1:0]            slot_busy;
+    reg  [1:0]            num_busy;
     reg  [ADDR_WIDTH-1:0] slot_addr [0:1];
     wire                  next_num;
-    assign next_num = slot_busy[0] ? 1'b1 : 1'b0;
+    assign next_num = num_busy[0] ? 1'b1 : 1'b0;
 
     assign err_addr = slot_addr[rid[0]];
 
@@ -127,14 +127,15 @@ module read_datapath #(
         end
     end
 
+    // NUM 0 1 assertion 
     always @(posedge clk) begin
         if (!rst_n) begin
-            slot_busy <= 2'b00;
+            num_busy <= 2'b00;
         end else if (init) begin
-            slot_busy <= 2'b00;
+            num_busy <= 2'b00;
         end else begin
-            if (ar_hs)         slot_busy[next_num] <= 1'b1;
-            if (r_hs && rlast) slot_busy[rid[0]]   <= 1'b0;
+            if (ar_hs)         num_busy[next_num] <= 1'b1;
+            if (r_hs && rlast) num_busy[rid[0]]   <= 1'b0;
         end
     end
 
@@ -170,8 +171,8 @@ module read_datapath #(
     //-----------------------------------------------------------
     //  (1) desired_beats      : burst_cfg
     //  (2) beats_to_boundary  : cur_addr ~ 4KB boundary addr
-    //                           -> non-alignment burst -> burst length automatic setting (shortest)
-    //                              && 4KB boundary check
+    //                           -> Split burst before crossing 4KB boundary
+    //                           -> Select the shortest valid burst length
     //  (3) remain_beats       : length - req_byte_cnt = #remained beat
     //                           -> last burst length < beat => burst length automatic setting (shortest)
     //-----------------------------------------------------------
@@ -180,9 +181,6 @@ module read_datapath #(
     wire [LEN_WIDTH-1:0]   bytes_to_boundary;
     wire [LEN_WIDTH-1:0]   beats_to_boundary;
     wire [LEN_WIDTH-1:0]   desired_beats;
-//    wire [LEN_WIDTH-1:0]   safe_beats;      // Current burst's #beat (req_pending=1, always 1~256 range)
-//    wire [LEN_WIDTH-1:0]   safe_bytes;      // safe_beats -> #bytes (beat converts byte)
-//    wire [BURST_WIDTH-1:0] safe_arlen;      // AXI ARLEN = #beat - 1 (ARLEN = 0 -> 1 beat)
 
     wire [LEN_WIDTH-1:0]   safe_beats_incr;
     wire [LEN_WIDTH-1:0]   safe_beats_fixed;
@@ -257,7 +255,7 @@ module read_datapath #(
     // Convert the selected Burst Beat count to Byte count
     assign safe_bytes = safe_beats << ADDR_LSB;
     // Convert the selected Burst Beat count to AXI ARLEN (ARLEN = Beats - 1)
-    assign safe_arlen = safe_beats[BURST_WIDTH-1:0] - 1'b1;
+    assign safe_arlen = safe_beats - 1'b1;
     // ======================================================================
 
     // Register in Datapath Update
@@ -266,11 +264,15 @@ module read_datapath #(
             cur_addr       <= {ADDR_WIDTH{1'b0}};
             req_byte_cnt   <= {LEN_WIDTH{1'b0}};
             total_byte_cnt <= {LEN_WIDTH{1'b0}};
+            slot_addr[0]   <= {ADDR_WIDTH{1'b0}};
+            slot_addr[1]   <= {ADDR_WIDTH{1'b0}};
         end
         else if (init) begin    // initialize - DMA Read Transfer Start 
             cur_addr       <= src_addr;
             req_byte_cnt   <= {LEN_WIDTH{1'b0}};
             total_byte_cnt <= {LEN_WIDTH{1'b0}};
+            slot_addr[0]   <= {ADDR_WIDTH{1'b0}};
+            slot_addr[1]   <= {ADDR_WIDTH{1'b0}};
         end
         else begin
             if (r_hs)           // R channel handshake
