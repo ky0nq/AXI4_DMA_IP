@@ -167,7 +167,92 @@ module axi4_write_datapath #(
     assign b_hs = bvalid && bready;
     wire w_hs = wvalid && wready;
 
-    wire [1:0] slave_sel = cur_addr[14] ? 2'b01 : 2'b00;  // ROM:00 / RAM:01, UART:10은 추후 주소 Decode 확장
+    //-----------------------------------------------------------
+    // AW Back-to-Back Issue Context
+    //-----------------------------------------------------------
+    // 현재 AW가 Handshake되는 Clock에는 cur_addr / req_byte_cnt가
+    // 아직 Register상 이전 값을 가지고 있다.
+    //
+    // 따라서 같은 Clock Edge에서 다음 AW를 바로 적재하려면
+    // 현재 AW Handshake 결과를 미리 반영한 주소와 요청 Byte 수를
+    // 기준으로 다음 Burst를 계산해야 한다.
+    //-----------------------------------------------------------
+
+    // 다음 AW가 사용할 주소
+    // AW Handshake가 없으면 현재 cur_addr 사용
+    // AW Handshake가 있으면 현재 AW Payload만큼 증가한 주소 사용
+    wire [ADDR_WIDTH-1:0] issue_addr =
+        aw_hs
+        ? (cur_addr + aw_payload_bytes[ADDR_WIDTH-1:0])
+        : cur_addr;
+
+    // 다음 AW 계산 시 기준이 되는 요청 완료 Byte 수
+    wire [LEN_WIDTH-1:0] issue_req_byte_cnt =
+        aw_hs
+        ? (req_byte_cnt + aw_payload_bytes)
+        : req_byte_cnt;
+
+    // 다음 AW 주소 기준 Slave 선택
+    // ROM:00 / RAM:01, UART:10은 추후 주소 Decode 확장
+    wire [1:0] issue_slave_sel =
+        issue_addr[14] ? 2'b01 : 2'b00;
+
+
+    //-----------------------------------------------------------
+    // Projected NUM / Outstanding State
+    //-----------------------------------------------------------
+    // 같은 Clock에 발생하는 B Handshake와 AW Handshake를 반영한
+    // 다음 상태를 미리 계산한다.
+    //
+    // Back-to-Back으로 다음 AW를 적재할 때는 현재 Register 값이 아니라
+    // 이 Projected 상태에서 FREE NUM과 Outstanding 여유를 확인한다.
+    //-----------------------------------------------------------
+
+    reg [1:0] projected_num_busy;
+
+    always @(*) begin
+        projected_num_busy = num_busy;
+
+        // B Response가 완료된 NUM은 FREE
+        if (b_hs)
+            projected_num_busy[bid[0]] = 1'b0;
+
+        // 현재 AW Handshake가 사용한 NUM은 BUSY
+        // B/AW가 같은 NUM에 동시에 걸리면 새 AW 사용 상태를 우선한다.
+        if (aw_hs)
+            projected_num_busy[awid[0]] = 1'b1;
+    end
+
+    wire projected_num_available =
+        (projected_num_busy != 2'b11);
+
+    // FREE 상태인 NUM을 선택
+    // 둘 다 FREE인 경우 NUM 0을 우선 사용
+    wire issue_selected_num =
+        (!projected_num_busy[0]) ? 1'b0 :
+        (!projected_num_busy[1]) ? 1'b1 :
+                                  1'b0;
+
+
+    reg [1:0] projected_aw_outstanding;
+
+    always @(*) begin
+        projected_aw_outstanding = aw_outstanding;
+
+        case ({aw_hs, b_hs})
+            2'b10:
+                projected_aw_outstanding =
+                    aw_outstanding + 2'd1;
+
+            2'b01:
+                projected_aw_outstanding =
+                    aw_outstanding - 2'd1;
+
+            default:
+                projected_aw_outstanding =
+                    aw_outstanding;
+        endcase
+    end
 
     //-----------------------------------------------------------
     // FIFO Read Pipeline / Data Alignment Buffer
@@ -219,18 +304,25 @@ module axi4_write_datapath #(
     //-----------------------------------------------------------
 
     // 아직 AW로 요청하지 않은 Payload Byte 수
-    wire [LEN_WIDTH-1:0] incr_remaining_bytes = (length > req_byte_cnt) ? (length - req_byte_cnt) : {LEN_WIDTH{1'b0}};
+    // Back-to-Back AW를 위해 현재 AW Handshake 결과까지 반영한
+    // issue_req_byte_cnt를 기준으로 계산한다.
+    wire [LEN_WIDTH-1:0] incr_remaining_bytes =
+        (length > issue_req_byte_cnt)
+        ? (length - issue_req_byte_cnt)
+        : {LEN_WIDTH{1'b0}};
     // 총 전송할 byte수가 지금까지 요청한 byte수 보다 크면? 총 전송할 byte - 요청한 byte, 아니면? zero extension
 
-    // 현재 주소의 Word 내부 Offset
-    // DATA_WIDTH = 32bit 기준 cur_addr[1:0]
-    wire [ADDR_LSB-1:0] incr_start_offset = cur_addr[ADDR_LSB-1:0];
+    // 다음 AW 주소의 Word 내부 Offset
+    // DATA_WIDTH = 32bit 기준 issue_addr[1:0]
+    wire [ADDR_LSB-1:0] incr_start_offset =
+        issue_addr[ADDR_LSB-1:0];
 
 
     // 다음 4KB Boundary까지 남은 Byte 수
     // 예) cur_addr = 0x1FF0
     //     0x2000 - 0x1FF0 = 16 Byte
-    wire [12:0] incr_bytes_to_4k_raw = 13'd4096 - {1'b0, cur_addr[11:0]}; // 4096(4KB) - 다음 AW에 실을 주소(현재 주소)
+    wire [12:0] incr_bytes_to_4k_raw =
+        13'd4096 - {1'b0, issue_addr[11:0]}; // 4096(4KB) - 다음 AW에 실을 주소(현재 주소)
 
     wire [LEN_WIDTH-1:0] incr_bytes_to_4k = {{(LEN_WIDTH - 13) {1'b0}}, incr_bytes_to_4k_raw};
 
@@ -349,10 +441,10 @@ module axi4_write_datapath #(
     end
 
 
-    wire req_pending = (req_byte_cnt < length);
-
-    wire num_available = (num_busy != 2'b11);
-    // 하나 이상의 NUM이 비어 있는지 확인
+    // 현재 AW Handshake 결과까지 반영했을 때
+    // 추가로 요청해야 할 Payload가 남아 있는지 확인
+    wire issue_req_pending =
+        (issue_req_byte_cnt < length);
 
     //-----------------------------------------------------------
     // Descriptor Queue 상태
@@ -362,6 +454,37 @@ module axi4_write_datapath #(
     wire desc_full  = (desc_count == 2'd2);
     wire desc_push = aw_hs;
     wire desc_pop  = w_hs && wlast && !desc_empty;
+
+    //-----------------------------------------------------------
+    // Projected Descriptor Queue State
+    //-----------------------------------------------------------
+    // 현재 Clock의 AW Handshake(Push)와 WLAST Handshake(Pop)를
+    // 반영한 뒤에도 Descriptor Queue에 다음 AW를 저장할 공간이
+    // 남는지 미리 확인한다.
+    //-----------------------------------------------------------
+
+    reg [1:0] projected_desc_count;
+
+    always @(*) begin
+        projected_desc_count = desc_count;
+
+        case ({desc_push, desc_pop})
+            2'b10:
+                projected_desc_count =
+                    desc_count + 2'd1;
+
+            2'b01:
+                projected_desc_count =
+                    desc_count - 2'd1;
+
+            default:
+                projected_desc_count =
+                    desc_count;
+        endcase
+    end
+
+    wire projected_desc_space =
+        (projected_desc_count < 2'd2);
     
     wire [BURST_WIDTH-1:0] current_desc_awlen;
     wire [LEN_WIDTH-1:0]   current_desc_payload_bytes;
@@ -611,7 +734,27 @@ module axi4_write_datapath #(
         load_data_ready;
 
 
-    wire aw_can_issue = en && !awvalid && req_pending && (aw_outstanding < 2) && num_available && !desc_full && burst_calc_valid;
+    //-----------------------------------------------------------
+    // AW Register Load Control
+    //-----------------------------------------------------------
+    // W Channel과 동일하게 AW Register가 비어 있거나
+    // 현재 AW가 Handshake되는 경우 다음 AW로 즉시 교체할 수 있다.
+    //-----------------------------------------------------------
+
+    wire aw_slot_available =
+        !awvalid || aw_hs;
+
+    // 현재 Clock의 AW/B/Descriptor 상태 변화를 모두 반영한 뒤
+    // 다음 AW를 발행할 수 있을 때만 AW Register를 적재한다.
+    wire aw_load_req =
+        en &&
+        !init &&
+        aw_slot_available &&
+        issue_req_pending &&
+        (projected_aw_outstanding < 2'd2) &&
+        projected_num_available &&
+        projected_desc_space &&
+        burst_calc_valid;
 
     //-----------------------------------------------------------
     // DMA Write Transfer 완료 판단
@@ -635,10 +778,10 @@ module axi4_write_datapath #(
     //-----------------------------------------------------------
     // AW NUM Allocator
     //-----------------------------------------------------------
-
-    // FREE 상태인 NUM을 선택
-    // 둘 다 FREE인 경우 NUM 0을 우선 사용
-    wire selected_num = (!num_busy[0]) ? 1'b0 : (!num_busy[1]) ? 1'b1 : 1'b0;
+    // NUM 선택은 위 Projected NUM State에서 수행한다.
+    // 따라서 현재 AW Handshake와 B Response가 같은 Clock에 있어도
+    // 다음 AW는 실제 다음 상태의 FREE NUM을 선택한다.
+    //-----------------------------------------------------------
 
     //-----------------------------------------------------------
     // cur_addr / req_byte_cnt / NUM / aw_outstanding
@@ -919,6 +1062,12 @@ module axi4_write_datapath #(
     //-----------------------------------------------------------
     // AW 채널 구동
     //-----------------------------------------------------------
+    // 현재 AW가 Handshake되는 Clock에 다음 AW를 바로 적재할 수 있다.
+    //
+    // AWREADY=1이고 Outstanding / NUM / Descriptor 여유가 있으면
+    // AWVALID을 1로 유지하면서 Back-to-Back AW Transaction을
+    // 발행할 수 있다.
+    //-----------------------------------------------------------
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             awvalid          <= 1'b0;
@@ -932,19 +1081,37 @@ module axi4_write_datapath #(
             awlen            <= {BURST_WIDTH{1'b0}};
             awid             <= 4'd0;
             aw_payload_bytes <= {LEN_WIDTH{1'b0}};
-        end else if (aw_hs) begin
-            // AWVALID && AWREADY가 성립하면
-            // 현재 AW 요청은 Slave에 전달 완료
-            awvalid <= 1'b0;
-        end else if (aw_can_issue) begin
-            // Burst Calculator 결과를 AW Register에 저장
-            awvalid          <= 1'b1;
-            awaddr           <= cur_addr;
-            awlen            <= actual_awlen;
-            awid             <= {MASTER_ID, slave_sel, selected_num};
+        end else begin
 
-            // 이 AW가 실제 담당하는 Payload Byte 수도 같이 저장
-            aw_payload_bytes <= actual_burst_bytes;
+            //---------------------------------------------------
+            // 다음 AW를 즉시 적재
+            //---------------------------------------------------
+            // 현재 AW Handshake와 동시에 발생할 수 있다.
+            // 이 경우 AWVALID을 0으로 내리지 않고 다음 AW로 교체한다.
+            //---------------------------------------------------
+            if (aw_load_req) begin
+                // 현재 AW Handshake 결과까지 반영한 주소 사용
+                awaddr <= issue_addr;
+
+                // Burst Calculator가 계산한 이번 Burst의 실제 AWLEN
+                awlen <= actual_awlen;
+
+                // 다음 상태에서 FREE인 NUM을 사용
+                awid <= {MASTER_ID, issue_slave_sel, issue_selected_num};
+
+                // 이 AW가 실제 담당하는 Payload Byte 수도 같이 저장
+                aw_payload_bytes <= actual_burst_bytes;
+
+                awvalid <= 1'b1;
+            end
+
+            //---------------------------------------------------
+            // 현재 AW는 Handshake됐지만 다음 AW를 아직 준비할 수 없음
+            //---------------------------------------------------
+            else if (aw_hs) begin
+                // 현재 AW 요청은 Slave에 전달 완료
+                awvalid <= 1'b0;
+            end
         end
     end
 
