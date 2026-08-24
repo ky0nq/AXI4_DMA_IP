@@ -1,48 +1,48 @@
 `timescale 1ns / 1ps
 
 module read_engine #(
-    parameter int ADDR_WIDTH  = 15,
-    parameter int DATA_WIDTH  = 32,
-    parameter int LEN_WIDTH   = 32,
-    parameter int BURST_WIDTH = 8
+    parameter ADDR_WIDTH  = 15,
+    parameter DATA_WIDTH  = 32,
+    parameter LEN_WIDTH   = 32,
+    parameter BURST_WIDTH = 8
 )(
-    input  logic                    clk,
-    input  logic                    rst_n,
+    input                         clk,
+    input                         rst_n,
 
     // Register Map
-    input  logic                    start,
-    input  logic                    abort,     // CTRL.ABORT
-    input  logic [ADDR_WIDTH-1:0]   src_addr,
-    input  logic [LEN_WIDTH-1:0]    length,
-    input  logic [BURST_WIDTH-1:0]  burst_cfg,
-    output logic                    busy,
-    output logic                    done,
-    output logic                    error,
-    output logic [31:0]             error_addr,
+    input                         start,
+    input                         abort,     // CTRL.ABORT
+    input  [ADDR_WIDTH-1:0]       src_addr,
+    input  [LEN_WIDTH-1:0]        length,
+    input  [BURST_WIDTH-1:0]      burst_cfg,
+    output                        busy,
+    output                        done,
+    output                        error,
+    output [31:0]                 error_addr,
 
     // FIFO
-    output logic                    fifo_wr_en,
-    output logic [DATA_WIDTH-1:0]   fifo_wr_data,
-    input  logic                    fifo_full,
+    output                        fifo_wr_en,
+    output [DATA_WIDTH-1:0]       fifo_wr_data,
+    input                         fifo_full,
 
     // AXI4-Full AR/R channel
-    output logic [3:0]              arid,
-    output logic [ADDR_WIDTH-1:0]   araddr,
-    output logic [BURST_WIDTH-1:0]  arlen,
-    output logic [2:0]              arsize,
-    output logic [1:0]              arburst,
-    output logic                    arvalid,
-    input  logic                    arready,
-    input  logic [DATA_WIDTH-1:0]   rdata,
-    input  logic                    rvalid,
-    input  logic                    rlast,
-    input  logic [3:0]              rid,
-    input  logic [1:0]              rresp,
-    output logic                    rready
+    output [3:0]                  arid,
+    output [ADDR_WIDTH-1:0]       araddr,
+    output [BURST_WIDTH-1:0]      arlen,
+    output [2:0]                  arsize,
+    output [1:0]                  arburst,
+    output                        arvalid,
+    input                         arready,
+    input  [DATA_WIDTH-1:0]       rdata,
+    input                         rvalid,
+    input                         rlast,
+    input  [3:0]                  rid,
+    input  [1:0]                  rresp,
+    output                        rready
 );
 
-    logic en, init, r_hs, xfer_done;
-    logic [ADDR_WIDTH-1:0] err_addr_w;
+    wire                  en, init, r_hs, xfer_done;
+    wire [ADDR_WIDTH-1:0] err_addr_w;
 
     read_control #(
         .ADDR_WIDTH(ADDR_WIDTH)
