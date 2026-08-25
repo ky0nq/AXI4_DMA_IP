@@ -25,8 +25,11 @@ module axi4_write_datapath #(
     // ---- Controller -> Datapath ----
     input wire en,   // state == S_DATA
     input wire init, // IDLE -> DATA 진입 1cycle pulse
-
+ 
     // ---- Register Map 입력 ----
+    // init 시점에 DMA 내부에서 설정값을 Capture한다.
+    // Transfer 진행 중 Register Map 값이 변경되더라도
+    // 현재 Transfer에는 영향을 주지 않는다.
     input wire [ ADDR_WIDTH-1:0] dst_addr,
     input wire [  LEN_WIDTH-1:0] length,    // 총 전송 바이트 수
     input wire [BURST_WIDTH+1:0] burst_cfg,
@@ -74,21 +77,54 @@ module axi4_write_datapath #(
     input wire bvalid,
     output wire bready
 );
-
     localparam MASTER_ID = 1'b1;  // ID[3] : DMA = 1
     localparam integer BYTES_PER_BEAT = DATA_WIDTH / 8;  // 4
     localparam integer ADDR_LSB = $clog2(BYTES_PER_BEAT);  // 2
 
     //-----------------------------------------------------------
+    // DMA Configuration Latch
+    //-----------------------------------------------------------
+    // DMA가 시작되는 init Clock에 Register Map 설정값을 저장한다.
+    //
+    // DMA 동작 중 CPU가 LENGTH / BURST_CFG Register를 변경하더라도
+    // 현재 진행 중인 Transfer에는 영향을 주지 않도록
+    // 내부에 저장된 설정값만 사용한다.
+    //
+    // DST_ADDR도 init 시 cfg_dst_addr에 저장하여
+    // DMA 시작 시점의 원본 Destination Address를 보관한다.
+    //
+    // 현재 INCR 동작에서는 cur_addr가 실제 Burst 주소를 관리하며,
+    // cfg_dst_addr는 추후 FIXED / WRAP 구현 시
+    // 원본 시작 주소를 참조할 수 있도록 유지한다.
+    //-----------------------------------------------------------
+
+    reg [ADDR_WIDTH-1:0]  cfg_dst_addr;
+    reg [LEN_WIDTH-1:0]   cfg_length;
+    reg [BURST_WIDTH+1:0] cfg_burst_cfg;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            cfg_dst_addr  <= {ADDR_WIDTH{1'b0}};
+            cfg_length    <= {LEN_WIDTH{1'b0}};
+            cfg_burst_cfg <= {(BURST_WIDTH+2){1'b0}};
+        end
+        else if (init) begin
+            cfg_dst_addr  <= dst_addr;
+            cfg_length    <= length;
+            cfg_burst_cfg <= burst_cfg;
+        end
+    end
+
+    //-----------------------------------------------------------
     // Burst Configuration Decode
     //-----------------------------------------------------------
-    // burst_cfg[9:8] : Burst Type
+    // cfg_burst_cfg[9:8] : Burst Type
     // 00 : FIXED
     // 01 : INCR
     // 10 : WRAP
     // 11 : Reserved
     //
-    // burst_cfg[7:0] : 최대 Burst Length
+    // cfg_burst_cfg[7:0] : 최대 Burst Length
     // AWLEN encoding
     //-----------------------------------------------------------
 
@@ -96,11 +132,9 @@ module axi4_write_datapath #(
     localparam [1:0] BURST_INCR  = 2'b01;
     localparam [1:0] BURST_WRAP  = 2'b10;
 
-    wire [1:0] burst_type =
-        burst_cfg[BURST_WIDTH+1:BURST_WIDTH];
+    wire [1:0] burst_type = cfg_burst_cfg[BURST_WIDTH+1:BURST_WIDTH];
 
-    wire [BURST_WIDTH-1:0] burst_len_cfg =
-        burst_cfg[BURST_WIDTH-1:0];
+    wire [BURST_WIDTH-1:0] burst_len_cfg = cfg_burst_cfg[BURST_WIDTH-1:0];
 
     assign awsize  = 3'b010;
     assign awburst = burst_type;
@@ -306,23 +340,20 @@ module axi4_write_datapath #(
     // 아직 AW로 요청하지 않은 Payload Byte 수
     // Back-to-Back AW를 위해 현재 AW Handshake 결과까지 반영한
     // issue_req_byte_cnt를 기준으로 계산한다.
-    wire [LEN_WIDTH-1:0] incr_remaining_bytes =
-        (length > issue_req_byte_cnt)
-        ? (length - issue_req_byte_cnt)
-        : {LEN_WIDTH{1'b0}};
-    // 총 전송할 byte수가 지금까지 요청한 byte수 보다 크면? 총 전송할 byte - 요청한 byte, 아니면? zero extension
+    //
+    // DMA 시작 시 저장한 cfg_length를 사용하므로
+    // Transfer 도중 외부 LENGTH Register가 변경되어도 영향을 받지 않는다.
+    wire [LEN_WIDTH-1:0] incr_remaining_bytes = (cfg_length > issue_req_byte_cnt) ? (cfg_length - issue_req_byte_cnt) : {LEN_WIDTH{1'b0}};
 
     // 다음 AW 주소의 Word 내부 Offset
     // DATA_WIDTH = 32bit 기준 issue_addr[1:0]
-    wire [ADDR_LSB-1:0] incr_start_offset =
-        issue_addr[ADDR_LSB-1:0];
+    wire [ADDR_LSB-1:0] incr_start_offset = issue_addr[ADDR_LSB-1:0];
 
 
     // 다음 4KB Boundary까지 남은 Byte 수
     // 예) cur_addr = 0x1FF0
     //     0x2000 - 0x1FF0 = 16 Byte
-    wire [12:0] incr_bytes_to_4k_raw =
-        13'd4096 - {1'b0, issue_addr[11:0]}; // 4096(4KB) - 다음 AW에 실을 주소(현재 주소)
+    wire [12:0] incr_bytes_to_4k_raw = 13'd4096 - {1'b0, issue_addr[11:0]}; // 4096(4KB) - 다음 AW에 실을 주소(현재 주소)
 
     wire [LEN_WIDTH-1:0] incr_bytes_to_4k = {{(LEN_WIDTH - 13) {1'b0}}, incr_bytes_to_4k_raw};
 
@@ -443,8 +474,7 @@ module axi4_write_datapath #(
 
     // 현재 AW Handshake 결과까지 반영했을 때
     // 추가로 요청해야 할 Payload가 남아 있는지 확인
-    wire issue_req_pending =
-        (issue_req_byte_cnt < length);
+    wire issue_req_pending = (issue_req_byte_cnt < cfg_length);
 
     //-----------------------------------------------------------
     // Descriptor Queue 상태
@@ -510,14 +540,11 @@ module axi4_write_datapath #(
     // length = 8 -> 2 Words
     //-----------------------------------------------------------
 
-    wire [LEN_WIDTH:0] fifo_total_words_calc =
-        ({1'b0, length} + (BYTES_PER_BEAT - 1)) >> ADDR_LSB;
+    wire [LEN_WIDTH:0] fifo_total_words_calc = ({1'b0, cfg_length} + (BYTES_PER_BEAT - 1)) >> ADDR_LSB;
 
-    wire [LEN_WIDTH-1:0] fifo_total_words =
-        fifo_total_words_calc[LEN_WIDTH-1:0];
+    wire [LEN_WIDTH-1:0] fifo_total_words = fifo_total_words_calc[LEN_WIDTH-1:0];
 
-    wire fifo_words_remaining =
-        (fifo_word_req_cnt < fifo_total_words);
+    wire fifo_words_remaining = (fifo_word_req_cnt < fifo_total_words);
 
     // 이전 Clock의 FIFO Read 요청에 대한 Data Return
     wire fifo_return = fifo_read_pending;
@@ -741,8 +768,7 @@ module axi4_write_datapath #(
     // 현재 AW가 Handshake되는 경우 다음 AW로 즉시 교체할 수 있다.
     //-----------------------------------------------------------
 
-    wire aw_slot_available =
-        !awvalid || aw_hs;
+    wire aw_slot_available = !awvalid || aw_hs;
 
     // 현재 Clock의 AW/B/Descriptor 상태 변화를 모두 반영한 뒤
     // 다음 AW를 발행할 수 있을 때만 AW Register를 적재한다.
@@ -761,7 +787,8 @@ module axi4_write_datapath #(
     //-----------------------------------------------------------
 
     // 전체 LENGTH만큼 W Data 전송 완료
-    wire payload_done = (total_byte_cnt >= length);
+    // DMA 시작 시 저장한 cfg_length 기준으로 판단한다.
+    wire payload_done = (total_byte_cnt >= cfg_length);
 
     // 현재 B Handshake가 마지막 Outstanding Transaction의 응답인지
     //
