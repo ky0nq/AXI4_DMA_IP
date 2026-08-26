@@ -16,18 +16,26 @@ module read_engine #(
     input                           abort,      // CTRL.ABORT
     input       [ADDR_WIDTH-1:0]    src_addr,
     input       [LEN_WIDTH-1:0]     length,
-    input       [BURST_WIDTH+1:0]   burst_cfg,  // [7:0] ARLEN , [9:8] burst type
+    input       [BURST_WIDTH+1:0]   burst_cfg,  // [7:0] ARLEN cap, [9:8] burst type
     output                          busy,
     output                          done,
     output                          error,
     output      [31:0]              error_addr,
-    output      [LEN_WIDTH-1:0]     error_offset, // bytes copied before the first failure
+    output      [LEN_WIDTH-1:0]     error_offset, // valid bytes before the first failure
     output      [BURST_WIDTH-1:0]   error_cnt,    // failing beat count (saturating)
 
-    // FIFO
+    // Sideband to the Write Engine (best-effort skip hint)
+    //   Not routed through the register map : the Write Engine compares
+    //   rd_err_offset against the byte offset it is about to write, and
+    //   drives WSTRB = 0 for anything at or beyond it. If the Write Engine
+    //   has already passed that offset (FIFO nearly empty) the zeros are
+    //   already in DST, which software handles via STATUS.ERROR.
+    output                          rd_err_valid,
+    output      [LEN_WIDTH-1:0]     rd_err_offset,
+
+    // FIFO : 32-bit, data only
     output                          fifo_wr_en,
     output      [DATA_WIDTH-1:0]    fifo_wr_data,
-    output      [(DATA_WIDTH/8)-1:0] fifo_wr_strb, // byte mask -> Write Engine WSTRB
     input                           fifo_full,
 
     // AXI4-Full AR/R channel
@@ -49,6 +57,10 @@ module read_engine #(
     wire                  en, init, r_hs, xfer_done;
     wire [ADDR_WIDTH-1:0] err_addr_w;
     wire                  err_valid_w, cfg_err_w;
+
+    // Sideband taps : same source as the register-map path, separate wires
+    assign rd_err_valid  = err_valid_w;
+    assign rd_err_offset = error_offset;
 
     read_control #(
         .ADDR_WIDTH(ADDR_WIDTH)
@@ -95,7 +107,6 @@ module read_engine #(
         .cfg_err      (cfg_err_w),
         .fifo_wr_en   (fifo_wr_en),
         .fifo_wr_data (fifo_wr_data),
-        .fifo_wr_strb (fifo_wr_strb),
         .fifo_full    (fifo_full),
         .arid         (arid),
         .araddr       (araddr),
