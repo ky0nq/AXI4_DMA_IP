@@ -193,7 +193,7 @@ module AXI_INTERCONNECT_R #(
             if (CPU_ARVALID && !(&VALID) && (M_GRANT_EN == 2'b00) && (QOS== 0 || QOS == 2'd1)) begin
                 AR_MASTER_VALID <= 1'b1;
                 M_GRANT_EN        <= 2'b01;
-		        S_GRANT_EN        <= CPU_ARID[2:1];
+		        S_GRANT_EN        <= CPU_ARID[2:1] + 2'b01;
                 ARID            <= CPU_ARID;
                 ARADDR          <= CPU_ARADDR;
                 ARLEN           <= CPU_ARLEN;
@@ -207,7 +207,7 @@ module AXI_INTERCONNECT_R #(
             else if (DMA_ARVALID && !(&VALID) && (M_GRANT_EN == 2'b00) && (QOS== 0 || QOS == 2'd2)) begin
                 AR_MASTER_VALID <= 1'b1;
                 M_GRANT_EN        <= 2'b10;
-		        S_GRANT_EN        <= DMA_ARID[2:1];
+		        S_GRANT_EN        <= DMA_ARID[2:1] + 2'b01;
                 ARID            <= DMA_ARID;
                 ARADDR          <= DMA_ARADDR;
                 ARLEN           <= DMA_ARLEN;

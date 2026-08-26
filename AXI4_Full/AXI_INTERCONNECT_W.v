@@ -256,7 +256,7 @@ module AXI_INTERCONNECT_W #(
             if (CPU_AWVALID && !(&VALID) && (M_GRANT_EN == 2'b00) && (QOS== 0 || QOS == 2'd1)) begin
                 MASTER_AWVALID <= 1'b1;
                 M_GRANT_EN        <= 2'b01;
-                S_GRANT_EN        <= CPU_AWID[2:1];
+                S_GRANT_EN        <= CPU_AWID[2:1] + 2'b01;
 
                 AWID            <= CPU_AWID;
                 AWADDR          <= CPU_AWADDR;
@@ -271,7 +271,7 @@ module AXI_INTERCONNECT_W #(
             else if (DMA_AWVALID && !(&VALID) && (M_GRANT_EN == 2'b00) && (QOS== 0 || QOS == 2'd2)) begin
                 MASTER_AWVALID <= 1'b1;
                 M_GRANT_EN        <= 2'b10;
-                S_GRANT_EN        <= DMA_AWID[2:1];
+                S_GRANT_EN        <= DMA_AWID[2:1] + 2'b01;
                 AWID            <= DMA_AWID;
                 AWADDR          <= DMA_AWADDR;
                 AWLEN           <= DMA_AWLEN;
