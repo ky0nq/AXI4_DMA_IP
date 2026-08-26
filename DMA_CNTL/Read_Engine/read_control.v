@@ -3,26 +3,27 @@
 module read_control #(
     parameter ADDR_WIDTH = 15
 )(
-    input                        clk,
-    input                        rst_n,
+    input                           clk,
+    input                           rst_n,
 
     // DMA Register Map
-    input                        start,
-    output reg                   busy,
-    output reg                   done,
-    output reg                   error,
-    output reg [31:0]            error_addr,
+    input                           start,
+    output reg                      busy,
+    output reg                      done,
+    output reg                      error,
+    output reg  [31:0]              error_addr,
 
     // Datapath
-    input                        fifo_full,
-    input                        r_hs,
-    input                        xfer_done,
-    input      [1:0]             rresp,
-    input      [ADDR_WIDTH-1:0]  err_addr,   // Error -> Where?
+    input                           fifo_full,
+    input                           r_hs,
+    input                           xfer_done,
+    input                           err_valid,  // RRESP error, already qualified by the datapath
+    input                           cfg_err,    // illegal / unserviceable configuration
+    input       [ADDR_WIDTH-1:0]    err_addr,   // base address of the failing burst
 
     // Datapath control signal
-    output                       en,         // state == S_DATA
-    output reg                   init        // IDLE -> DATA 진입 pulse
+    output                          en,         // state == S_DATA
+    output reg                      init        // IDLE -> DATA 진입 pulse
 );
 
     // State
@@ -69,11 +70,14 @@ module read_control #(
             end
         end
         else begin
-            if (r_hs && (rresp != 2'b00) && !error) begin             // handshake done -> error exists
+            // The datapath owns error detection : it checks RRESP[1] on every
+            
+            // DONE and ERROR are independent 
+            if ((err_valid || cfg_err) && !error) begin
                 error      <= 1'b1;
-                error_addr <= {{(32-ADDR_WIDTH){1'b0}}, err_addr};    // error address latch
+                error_addr <= {{(32-ADDR_WIDTH){1'b0}}, err_addr};   // error address latch
             end
-            if (xfer_done) begin                                      // handshake done -> done signal
+            if (xfer_done) begin                                     // transfer finished
                 busy <= 1'b0;
                 done <= 1'b1;
             end
