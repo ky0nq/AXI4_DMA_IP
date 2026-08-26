@@ -7,7 +7,13 @@ module read_datapath #(
     parameter BURST_WIDTH  = 8,
     // ROM 0x0000~0x3FFF / RAM 0x4000~0x7FFF
     // -> each region is 16KB, decoded by cur_addr[REGION_LSB].
-    parameter REGION_LSB   = 14
+    parameter REGION_LSB   = 14,
+
+    // Burst size cap = 16B = 4 beats, matching a MicroBlaze cache line
+    // (C_DCACHE_LINE_LEN = 4 words). Keeping the DMA burst equal to the
+    // line size means a later cache-fill path needs no burst re-sizing.
+    
+    parameter MAX_BURST_BYTES = 16
 )(
     input                            clk,
     input                            rst_n,
@@ -27,6 +33,8 @@ module read_datapath #(
     output                           xfer_done,   // transfer done or abort assertion
     output     [ADDR_WIDTH-1:0]      err_addr,
     output reg                       err_valid,   // RRESP error latched
+    output reg [LEN_WIDTH-1:0]       err_offset,  // byte offset where the first error occurred
+    output reg [BURST_WIDTH-1:0]     err_cnt,     // number of failing beats (saturating)
     output reg                       cfg_err,     // illegal / unserviceable configuration
 
     // FIFO
@@ -58,6 +66,7 @@ module read_datapath #(
     localparam PAGE_BYTES           = 4096;                     // AXI4-Full Maximum burst size = 4KB boundary
     localparam PAGE_LSB             = $clog2(PAGE_BYTES);       // 12
     localparam REGION_BYTES         = (1 << REGION_LSB);        // 16KB per slave region
+    localparam MAX_BURST_BEATS      = MAX_BURST_BYTES / BYTES_PER_BEAT;  // 16/4 = 4 beats
     localparam [2:0] ARSIZE_VAL     = ADDR_LSB;
 
     assign arsize = ARSIZE_VAL;
@@ -115,7 +124,7 @@ module read_datapath #(
     reg [ADDR_WIDTH-1:0] cur_addr;        // Next AR address (always beat-aligned)
     reg [LEN_WIDTH-1:0]  req_beat_cnt;    // requested beats
     reg [LEN_WIDTH-1:0]  rcv_beat_cnt;    // received beats -> Padding control purpose
-    reg [LEN_WIDTH-1:0]  total_byte_cnt;  // total valid (non-padded) bytes received
+    reg [LEN_WIDTH-1:0]  total_byte_cnt;  // bytes actually committed to the destination
 
     reg [1:0]            num_busy;
     reg [ADDR_WIDTH-1:0] slot_addr [0:1];
@@ -207,10 +216,10 @@ module read_datapath #(
     assign outstanding_ok = (outstanding_cnt < 2'd2);
 
     //----------------------------------------------------------
-    // (1) desired_beats      : burst_cfg
+    // (1) desired_beats      : burst_cfg, capped at MAX_BURST_BEATS
     // (2) beats_to_boundary  : cur_addr ~ 4KB boundary addr
     //      -> Split burst before crossing 4KB boundary
-    // (3) beats_to_region    : cur_addr ~ ROM/RAM region boundary  [FIX-3]
+    // (3) beats_to_region    : cur_addr ~ ROM/RAM region boundary
     //      -> A burst must never span two slaves. The interconnect decodes
     //         ARADDR once and routes the whole burst to that slave.
     // (4) remain_beats       : total_beats - req_beat_cnt
@@ -222,6 +231,7 @@ module read_datapath #(
     wire [LEN_WIDTH-1:0] beats_to_boundary;
     wire [LEN_WIDTH-1:0] bytes_to_region;
     wire [LEN_WIDTH-1:0] beats_to_region;
+    wire [LEN_WIDTH-1:0] desired_raw;
     wire [LEN_WIDTH-1:0] desired_beats;
     wire [LEN_WIDTH-1:0] limit_beats;
 
@@ -245,12 +255,17 @@ module read_datapath #(
                                // == bytes_to_region = 16384 - (cur_addr % 16384)
     assign beats_to_region   = bytes_to_region >> ADDR_LSB;
 
-    assign desired_beats     = {{(LEN_WIDTH-BURST_WIDTH){1'b0}}, burst_len_cfg} + 1'b1; // Beats = ARLEN + 1
+    assign desired_raw       = {{(LEN_WIDTH-BURST_WIDTH){1'b0}}, burst_len_cfg} + 1'b1; // Beats = ARLEN + 1
     /*
         ARLEN = 0 , Beat = 1
         ARLEN = 1 , Beat = 2
         ARLEN = 3 , Beat = 4
     */
+
+    // Hardware cap : a register-map value larger than MAX_BURST_BEATS is
+    // clamped here, so no configuration can exceed one cache line per burst.
+    assign desired_beats     = (desired_raw > MAX_BURST_BEATS) ? MAX_BURST_BEATS
+                                                               : desired_raw;
 
     // min(4KB boundary, slave region boundary)
     assign limit_beats = (beats_to_boundary < beats_to_region) ? beats_to_boundary
@@ -282,6 +297,8 @@ module read_datapath #(
     // AXI4 WRAP supports only 2 / 4 / 8 / 16 beats.
     // Choose the largest legal size that does not exceed
     // desired_beats and remain_beats.
+    // With MAX_BURST_BEATS = 4 only the 4 / 2 arms are reachable; the
+    // 16 / 8 arms stay for when the cap is raised.
     // NOTE: a remainder of 1 beat has no legal WRAP length, so
     //       safe_beats_wrap becomes 0 and cfg_err is raised.    
     // ---------------------------------------------------------
@@ -311,6 +328,8 @@ module read_datapath #(
     //  !init          : init cycle = Before cur_addr / req_beat_cnt update
     //  safe_beats!=0  : prevents the 8'hFF underflow / zero-progress lock
     //  !cfg_err       : an unserviceable configuration must not keep issuing
+    //  NOTE: err_valid is deliberately NOT in this list. An RRESP error voids
+    //        only the failing burst; the transfer continues with the next one.
     wire ar_can_issue;
     assign ar_can_issue = en && !init && !arvalid && req_pending && !abort_lat
                           && outstanding_ok && same_slave_ok
@@ -323,6 +342,10 @@ module read_datapath #(
     //   Typical causes: WRAP with a non power-of-two remainder,
     //                   WRAP with an unaligned start address (illegal in AXI),
     //                   an unsupported ARBURST encoding (2'b11).
+    //
+    //   cfg_err  : configuration fault    -> stops issuing new AR
+    //   err_valid: transfer fault (RRESP) -> does NOT stop issuing
+    //   abort_lat: software forced stop   -> stops issuing new AR
     //======================================================================
     wire wrap_illegal;  // WRAP type but, non-alignment == AXI violation
     assign wrap_illegal = (burst_type_cfg == 2'b10) && (head_off_q != {ADDR_LSB{1'b0}}); 
@@ -350,6 +373,72 @@ module read_datapath #(
     // Transfer Done == Burst Response Done
     assign xfer_done = !init && ar_done && (outstanding_cnt == 2'd0); // Do exists request != Transfer Done
 
+
+    //======================================================================
+    //   R channel : head / tail byte masking, zero padding
+    //
+    //   first beat : bytes below head_off_q belong to the previous aligned
+    //                word and are not part of the payload
+    //   last  beat : bytes at or above tail_off are past the end of LENGTH
+    //                (tail_off == 0 means the last beat is fully valid)
+    //
+    //   Declared ahead of the datapath register block because the byte
+    //   counter there consumes eff_strb.
+    //======================================================================
+    wire first_beat, last_beat;
+    assign first_beat = (rcv_beat_cnt == {LEN_WIDTH{1'b0}});
+    assign last_beat  = (rcv_beat_cnt == (total_beats_q - 1'b1));
+
+    reg [BYTES_PER_BEAT-1:0] beat_strb_c; // Valid Byte check (alignment only)
+
+    always @(*) begin
+        for (i = 0; i < BYTES_PER_BEAT; i = i + 1) begin
+            beat_strb_c[i] = 1'b1;
+            if (first_beat && (i < head_off_q))
+                beat_strb_c[i] = 1'b0;                       // head padding
+            if (last_beat && (tail_off != {ADDR_LSB{1'b0}}) && (i >= tail_off))
+                beat_strb_c[i] = 1'b0;                       // tail padding
+        end
+    end
+
+
+    // Per-beat RRESP error handling
+    //   Void the failing beat and the rest of its burst (strb = 0).
+    //   Voided beats are still pushed so the beat count stays in step with
+    //   the Write Engine; WSTRB = 0 leaves those DST bytes unmodified.
+    //   Cleared at rlast -> next burst runs normally.
+
+    wire beat_err;
+    assign beat_err = r_beat && rresp[1];       // SLVERR(2'b10) / DECERR(2'b11)
+    /*
+        2'b00  OKAY    → rresp[1] = 0   OKAY 
+        2'b01  EXOKAY  → rresp[1] = 0   OKAY = Exclusive Access Done -> Slave return
+        2'b10  SLVERR  → rresp[1] = 1   Error
+        2'b11  DECERR  → rresp[1] = 1   Error
+    */
+
+    reg burst_err_lat;                          // sticky until this burst ends
+    always @(posedge clk) begin
+        if (!rst_n)            burst_err_lat <= 1'b0;
+        else if (init)         burst_err_lat <= 1'b0;
+        else if (r_burst_end)  burst_err_lat <= 1'b0;   // released at rlast
+        else if (beat_err)     burst_err_lat <= 1'b1;
+    end
+
+    wire beat_void;
+    assign beat_void = beat_err || burst_err_lat;
+
+    // effective strobe : alignment mask, forced to 0 on a voided beat
+    wire [BYTES_PER_BEAT-1:0] eff_strb;
+    assign eff_strb = beat_void ? {BYTES_PER_BEAT{1'b0}} : beat_strb_c;
+
+    // R channel -> FIFO
+    always @(*) begin
+        fifo_wr_en   = r_beat;                  // every qualified beat is pushed
+        fifo_wr_strb = eff_strb;
+        for (i = 0; i < BYTES_PER_BEAT; i = i + 1)
+            fifo_wr_data[i*8 +: 8] = eff_strb[i] ? rdata[i*8 +: 8] : 8'h00;  // masking
+    end
 
 
     // Register in Datapath Update
@@ -379,8 +468,9 @@ module read_datapath #(
         else begin
             if (r_beat) begin                       // qualified R beat
                 rcv_beat_cnt   <= rcv_beat_cnt + 1'b1;
-                // count only valid (non-padded) bytes                      [FIX-6]
-                total_byte_cnt <= total_byte_cnt + count_ones(beat_strb_c);
+                // eff_strb, not beat_strb_c : a voided beat contributes 0, so
+                // total_byte_cnt reports the bytes actually written to DST
+                total_byte_cnt <= total_byte_cnt + count_ones(eff_strb);
             end
 
             if (ar_hs) begin                        // AR channel handshake
@@ -436,9 +526,11 @@ module read_datapath #(
     end
 
 
-    //  RRESP capture
-    //  slot_addr is indexed by the responding ID, so the faulting burst
-    //  base address is recoverable. Only the first error is latched.
+    // RRESP capture
+    //   First failure latches the burst base address and err_offset
+    //   (bytes copied so far = software resume point).
+    //   err_cnt counts every failing beat, saturating.
+
     reg [ADDR_WIDTH-1:0] err_addr_q;
     assign err_addr = err_addr_q;
 
@@ -446,45 +538,24 @@ module read_datapath #(
         if (!rst_n) begin
             err_valid  <= 1'b0;
             err_addr_q <= {ADDR_WIDTH{1'b0}};
+            err_offset <= {LEN_WIDTH{1'b0}};
+            err_cnt    <= {BURST_WIDTH{1'b0}};
         end
         else if (init) begin
             err_valid  <= 1'b0;
             err_addr_q <= {ADDR_WIDTH{1'b0}};
+            err_offset <= {LEN_WIDTH{1'b0}};
+            err_cnt    <= {BURST_WIDTH{1'b0}};
         end
-        else if (r_beat && rresp[1] && !err_valid) begin   // SLVERR(2'b10) / DECERR(2'b11)
-            err_valid  <= 1'b1;
-            err_addr_q <= slot_addr[rid[0]];
+        else begin
+            if (beat_err && !err_valid) begin              // first failure only
+                err_valid  <= 1'b1;
+                err_addr_q <= slot_addr[rid[0]];
+                err_offset <= total_byte_cnt;
+            end
+            if (beat_err && (err_cnt != {BURST_WIDTH{1'b1}}))
+                err_cnt <= err_cnt + 1'b1;                 // saturating
         end
-    end
-
-    //   R channel : head / tail byte masking, zero padding
-    //
-    //   first beat : bytes below head_off_q belong to the previous aligned
-    //                word and are not part of the payload
-    //   last  beat : bytes at or above tail_off are past the end of LENGTH
-    //                (tail_off == 0 means the last beat is fully valid)
-    wire first_beat, last_beat;
-    assign first_beat = (rcv_beat_cnt == {LEN_WIDTH{1'b0}});
-    assign last_beat  = (rcv_beat_cnt == (total_beats_q - 1'b1));
-
-    reg [BYTES_PER_BEAT-1:0] beat_strb_c; // Valid Byte check
-
-    always @(*) begin
-        for (i = 0; i < BYTES_PER_BEAT; i = i + 1) begin
-            beat_strb_c[i] = 1'b1;
-            if (first_beat && (i < head_off_q))
-                beat_strb_c[i] = 1'b0;                       // head padding
-            if (last_beat && (tail_off != {ADDR_LSB{1'b0}}) && (i >= tail_off))
-                beat_strb_c[i] = 1'b0;                       // tail padding
-        end
-    end
-
-    // R channel -> FIFO
-    always @(*) begin
-        fifo_wr_en   = r_beat;                               // qualified
-        fifo_wr_strb = beat_strb_c;
-        for (i = 0; i < BYTES_PER_BEAT; i = i + 1)
-            fifo_wr_data[i*8 +: 8] = beat_strb_c[i] ? rdata[i*8 +: 8] : 8'h00;  // masking
     end
 
     // valid byte counter helper
