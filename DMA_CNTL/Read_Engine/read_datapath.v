@@ -12,7 +12,7 @@ module read_datapath #(
     // Burst size cap = 16B = 4 beats, matching a MicroBlaze cache line
     // (C_DCACHE_LINE_LEN = 4 words). Keeping the DMA burst equal to the
     // line size means a later cache-fill path needs no burst re-sizing.
-    
+
     parameter MAX_BURST_BYTES = 16
 )(
     input                            clk,
@@ -37,10 +37,13 @@ module read_datapath #(
     output reg [BURST_WIDTH-1:0]     err_cnt,     // number of failing beats (saturating)
     output reg                       cfg_err,     // illegal / unserviceable configuration
 
-    // FIFO
+    // FIFO : 32-bit, data only.
+    //   Alignment WSTRB is regenerated inside the Write Engine from
+    //   dst_addr / length. Valid because the register map enforces
+    //   src_addr[ADDR_LSB-1:0] == dst_addr[ADDR_LSB-1:0], so both engines
+    //   derive the same head / tail mask independently.
     output reg                       fifo_wr_en,
     output reg [DATA_WIDTH-1:0]      fifo_wr_data,
-    output reg [(DATA_WIDTH/8)-1:0]  fifo_wr_strb, // byte valid mask for Write Engine WSTRB
     input                            fifo_full,
 
     // AXI4 AR / R channel
@@ -56,7 +59,7 @@ module read_datapath #(
     input                            rvalid,
     input                            rlast,
     input      [3:0]                 rid,
-    input      [1:0]                 rresp,       
+    input      [1:0]                 rresp,
     output                           rready
 );
 
@@ -112,9 +115,9 @@ module read_datapath #(
 
     // Latched at init so a register-map write mid-transfer cannot corrupt
     // the in-flight burst planning.
-    reg [ADDR_LSB-1:0]   head_off_q;    
-    reg [LEN_WIDTH-1:0]  span_byte_q;   
-    reg [LEN_WIDTH-1:0]  total_beats_q; 
+    reg [ADDR_LSB-1:0]   head_off_q;
+    reg [LEN_WIDTH-1:0]  span_byte_q;
+    reg [LEN_WIDTH-1:0]  total_beats_q;
 
     wire [ADDR_LSB-1:0]  tail_off;
     assign tail_off = span_byte_q[ADDR_LSB-1:0];  // 0 => last beat is fully valid
@@ -124,7 +127,7 @@ module read_datapath #(
     reg [ADDR_WIDTH-1:0] cur_addr;        // Next AR address (always beat-aligned)
     reg [LEN_WIDTH-1:0]  req_beat_cnt;    // requested beats
     reg [LEN_WIDTH-1:0]  rcv_beat_cnt;    // received beats -> Padding control purpose
-    reg [LEN_WIDTH-1:0]  total_byte_cnt;  // bytes actually committed to the destination
+    reg [LEN_WIDTH-1:0]  total_byte_cnt;  // valid (non-padded, non-voided) bytes received
 
     reg [1:0]            num_busy;
     reg [ADDR_WIDTH-1:0] slot_addr [0:1];
@@ -142,7 +145,7 @@ module read_datapath #(
     // slot, decrement outstanding_cnt or be pushed into the FIFO.
     wire r_mine, r_beat, r_burst_end;
     assign r_mine      = (rid[3] == MASTER_ID); // RID[3] == 1, DMA response
-    assign r_beat      = r_hs && r_mine;        // Valid Data Beat 
+    assign r_beat      = r_hs && r_mine;        // Valid Data Beat
     assign r_burst_end = r_beat && rlast;       // -> Beat's Burst Last
 
     wire [1:0] slave_sel;
@@ -283,7 +286,7 @@ module read_datapath #(
 
     // ---------------------------------------------------------
     // INCR Burst
-    // Must not cross a 4KB boundary, and must not cross the ROM/RAM region boundary.                                
+    // Must not cross a 4KB boundary, and must not cross the ROM/RAM region boundary.
     // INCR: min(Max Beats, Beats to 4KB Boundary,
     //           Beats to Region Boundary, Remaining Beats)
     // ---------------------------------------------------------
@@ -300,7 +303,7 @@ module read_datapath #(
     // With MAX_BURST_BEATS = 4 only the 4 / 2 arms are reachable; the
     // 16 / 8 arms stay for when the cap is raised.
     // NOTE: a remainder of 1 beat has no legal WRAP length, so
-    //       safe_beats_wrap becomes 0 and cfg_err is raised.    
+    //       safe_beats_wrap becomes 0 and cfg_err is raised.
     // ---------------------------------------------------------
     assign safe_beats_wrap =
         ((desired_beats >= 16) && (remain_beats >= 16)) ? 16 :
@@ -348,7 +351,7 @@ module read_datapath #(
     //   abort_lat: software forced stop   -> stops issuing new AR
     //======================================================================
     wire wrap_illegal;  // WRAP type but, non-alignment == AXI violation
-    assign wrap_illegal = (burst_type_cfg == 2'b10) && (head_off_q != {ADDR_LSB{1'b0}}); 
+    assign wrap_illegal = (burst_type_cfg == 2'b10) && (head_off_q != {ADDR_LSB{1'b0}});
 
     wire no_progress;   // Transfer Remain & Legal Burst length don't make
     assign no_progress = en && !init && req_pending && !abort_lat
@@ -382,6 +385,10 @@ module read_datapath #(
     //   last  beat : bytes at or above tail_off are past the end of LENGTH
     //                (tail_off == 0 means the last beat is fully valid)
     //
+    //   The mask is not forwarded to the FIFO. It only zero-fills the data
+    //   so the FIFO content is deterministic, and feeds total_byte_cnt.
+    //   The Write Engine rebuilds the same mask from dst_addr / length.
+    //
     //   Declared ahead of the datapath register block because the byte
     //   counter there consumes eff_strb.
     //======================================================================
@@ -403,18 +410,20 @@ module read_datapath #(
 
 
     // Per-beat RRESP error handling
-    //   Void the failing beat and the rest of its burst (strb = 0).
+    //   Void the failing beat and the rest of its burst : its data is
+    //   zero-filled before entering the FIFO.
     //   Voided beats are still pushed so the beat count stays in step with
-    //   the Write Engine; WSTRB = 0 leaves those DST bytes unmodified.
+    //   the Write Engine; dropping them would shift every later burst to a
+    //   wrong destination address.
     //   Cleared at rlast -> next burst runs normally.
 
     wire beat_err;
     assign beat_err = r_beat && rresp[1];       // SLVERR(2'b10) / DECERR(2'b11)
     /*
-        2'b00  OKAY    → rresp[1] = 0   OKAY 
-        2'b01  EXOKAY  → rresp[1] = 0   OKAY = Exclusive Access Done -> Slave return
-        2'b10  SLVERR  → rresp[1] = 1   Error
-        2'b11  DECERR  → rresp[1] = 1   Error
+        2'b00  OKAY    -> rresp[1] = 0   OKAY
+        2'b01  EXOKAY  -> rresp[1] = 0   OKAY = Exclusive Access Done -> Slave return
+        2'b10  SLVERR  -> rresp[1] = 1   Error
+        2'b11  DECERR  -> rresp[1] = 1   Error
     */
 
     reg burst_err_lat;                          // sticky until this burst ends
@@ -432,10 +441,9 @@ module read_datapath #(
     wire [BYTES_PER_BEAT-1:0] eff_strb;
     assign eff_strb = beat_void ? {BYTES_PER_BEAT{1'b0}} : beat_strb_c;
 
-    // R channel -> FIFO
+    // R channel -> FIFO (data only, 32-bit)
     always @(*) begin
         fifo_wr_en   = r_beat;                  // every qualified beat is pushed
-        fifo_wr_strb = eff_strb;
         for (i = 0; i < BYTES_PER_BEAT; i = i + 1)
             fifo_wr_data[i*8 +: 8] = eff_strb[i] ? rdata[i*8 +: 8] : 8'h00;  // masking
     end
@@ -443,7 +451,7 @@ module read_datapath #(
 
     // Register in Datapath Update
     always @(posedge clk) begin
-        if (!rst_n) begin                      
+        if (!rst_n) begin
             cur_addr       <= {ADDR_WIDTH{1'b0}};
             req_beat_cnt   <= {LEN_WIDTH{1'b0}};
             rcv_beat_cnt   <= {LEN_WIDTH{1'b0}};
@@ -469,7 +477,7 @@ module read_datapath #(
             if (r_beat) begin                       // qualified R beat
                 rcv_beat_cnt   <= rcv_beat_cnt + 1'b1;
                 // eff_strb, not beat_strb_c : a voided beat contributes 0, so
-                // total_byte_cnt reports the bytes actually written to DST
+                // total_byte_cnt tracks the bytes that are actually valid
                 total_byte_cnt <= total_byte_cnt + count_ones(eff_strb);
             end
 
@@ -517,18 +525,19 @@ module read_datapath #(
         end
         else if (ar_can_issue) begin
             arvalid    <= 1'b1;
-            araddr     <= cur_addr;                 // already beat-aligned 
+            araddr     <= cur_addr;                 // already beat-aligned
             arlen      <= safe_arlen;
             arid       <= {MASTER_ID, slave_sel, next_num}; // Generate ID for Arbiter table
             ar_num_q   <= next_num;                 // freeze what was actually issued
-            ar_slave_q <= slave_sel;                
+            ar_slave_q <= slave_sel;
         end
     end
 
 
     // RRESP capture
     //   First failure latches the burst base address and err_offset
-    //   (bytes copied so far = software resume point).
+    //   (valid bytes so far = software resume point, also the sideband
+    //   hint the Write Engine compares against).
     //   err_cnt counts every failing beat, saturating.
 
     reg [ADDR_WIDTH-1:0] err_addr_q;
