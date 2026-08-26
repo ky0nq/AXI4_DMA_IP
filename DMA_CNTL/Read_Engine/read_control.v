@@ -70,9 +70,11 @@ module read_control #(
             end
         end
         else begin
-            // The datapath owns error detection : it checks RRESP[1] on every
-            
-            // DONE and ERROR are independent 
+            // The datapath owns error detection : it checks RRESP[1] and
+            // registers err_addr, so sampling err_valid here one cycle later
+            // reads a stable address.
+            // DONE and ERROR are independent. DONE = 1 with ERROR = 1 means
+            // the transfer finished but the destination is not trustworthy.
             if ((err_valid || cfg_err) && !error) begin
                 error      <= 1'b1;
                 error_addr <= {{(32-ADDR_WIDTH){1'b0}}, err_addr};   // error address latch
