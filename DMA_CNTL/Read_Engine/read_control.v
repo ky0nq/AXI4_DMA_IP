@@ -7,23 +7,25 @@ module read_control #(
     input                           rst_n,
 
     // DMA Register Map
+    //   ERROR register (0x1C) is done by the register map, which owns the
+    //   layout : [29:15] read error address, [14:0] write error address.
     input                           start,
     output reg                      busy,
     output reg                      done,
     output reg                      error,
-    output reg  [31:0]              error_addr,
+    output reg  [ADDR_WIDTH-1:0]    error_addr,
 
     // Datapath
     input                           fifo_full,
     input                           r_hs,
     input                           xfer_done,
     input                           err_valid,  // RRESP error, already qualified by the datapath
-    input                           cfg_err,    // illegal / unserviceable configuration
+    input                           cfg_err,    // alignment / burst configuration fault
     input       [ADDR_WIDTH-1:0]    err_addr,   // base address of the failing burst
 
     // Datapath control signal
     output                          en,         // state == S_DATA
-    output reg                      init        // IDLE -> DATA 진입 pulse
+    output reg                      init        // IDLE -> DATA start 1 pulse
 );
 
     // State
@@ -60,7 +62,7 @@ module read_control #(
             busy       <= 1'b0;
             done       <= 1'b0;
             error      <= 1'b0;
-            error_addr <= 32'd0;
+            error_addr <= {ADDR_WIDTH{1'b0}};
         end
         else if (state == S_IDLE) begin
             if (!fifo_full && start) begin  // transfer start -> signal setting
@@ -77,9 +79,9 @@ module read_control #(
             // the transfer finished but the destination is not trustworthy.
             if ((err_valid || cfg_err) && !error) begin
                 error      <= 1'b1;
-                error_addr <= {{(32-ADDR_WIDTH){1'b0}}, err_addr};   // error address latch
+                error_addr <= err_addr;      // no shifting here, register map places it
             end
-            if (xfer_done) begin                                     // transfer finished
+            if (xfer_done) begin             // transfer finished
                 busy <= 1'b0;
                 done <= 1'b1;
             end
