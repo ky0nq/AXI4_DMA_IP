@@ -6,34 +6,28 @@ module read_engine #(
     parameter LEN_WIDTH       = 32,
     parameter BURST_WIDTH     = 8,
     parameter REGION_LSB      = 14,
-    parameter MAX_BURST_BYTES = 16       // 16B = 4 beats (MicroBlaze cache line)
+    parameter MAX_BURST_BYTES = 16       // 16B = 4 beats (because, MicroBlaze cache line)
 )(
     input                           clk,
     input                           rst_n,
 
     // Register Map
+    //   SRC_ADDR and LENGTH must be 4-byte aligned. The register map should
+    //   reject START otherwise; the datapath also raises cfg_err as a backstop.
+    //   error_addr is the address of the beat that failed, ADDR_WIDTH wide.
+    //   The register map places it into the ERROR register (0x1C) at [29:15];
+    //   [14:0] belongs to the Write Engine.
+
     input                           start,
     input                           abort,      // CTRL.ABORT
     input       [ADDR_WIDTH-1:0]    src_addr,
     input       [LEN_WIDTH-1:0]     length,
-    input       [BURST_WIDTH+1:0]   burst_cfg,  // [7:0] ARLEN cap, [9:8] burst type
+    input       [BURST_WIDTH+1:0]   burst_cfg,  // [7:0] ARLEN, [9:8] burst type
     output                          busy,
     output                          done,
     output                          error,
-    output      [31:0]              error_addr,
-    output      [LEN_WIDTH-1:0]     error_offset, // valid bytes before the first failure
-    output      [BURST_WIDTH-1:0]   error_cnt,    // failing beat count (saturating)
+    output      [ADDR_WIDTH-1:0]    error_addr,
 
-    // Sideband to the Write Engine (best-effort skip hint)
-    //   Not routed through the register map : the Write Engine compares
-    //   rd_err_offset against the byte offset it is about to write, and
-    //   drives WSTRB = 0 for anything at or beyond it. If the Write Engine
-    //   has already passed that offset (FIFO nearly empty) the zeros are
-    //   already in DST, which software handles via STATUS.ERROR.
-    output                          rd_err_valid,
-    output      [LEN_WIDTH-1:0]     rd_err_offset,
-
-    // FIFO : 32-bit, data only
     output                          fifo_wr_en,
     output      [DATA_WIDTH-1:0]    fifo_wr_data,
     input                           fifo_full,
@@ -58,10 +52,6 @@ module read_engine #(
     wire [ADDR_WIDTH-1:0] err_addr_w;
     wire                  err_valid_w, cfg_err_w;
 
-    // Sideband taps : same source as the register-map path, separate wires
-    assign rd_err_valid  = err_valid_w;
-    assign rd_err_offset = error_offset;
-
     read_control #(
         .ADDR_WIDTH(ADDR_WIDTH)
     ) U_READ_CNTL (
@@ -75,7 +65,7 @@ module read_engine #(
         .fifo_full  (fifo_full),
         .r_hs       (r_hs),
         .xfer_done  (xfer_done),
-        .err_valid  (err_valid_w),   // decided by the datapath, not re-derived here
+        .err_valid  (err_valid_w), 
         .cfg_err    (cfg_err_w),
         .err_addr   (err_addr_w),
         .en         (en),
@@ -102,8 +92,6 @@ module read_engine #(
         .xfer_done    (xfer_done),
         .err_addr     (err_addr_w),
         .err_valid    (err_valid_w),
-        .err_offset   (error_offset),
-        .err_cnt      (error_cnt),
         .cfg_err      (cfg_err_w),
         .fifo_wr_en   (fifo_wr_en),
         .fifo_wr_data (fifo_wr_data),
