@@ -6,6 +6,7 @@ AXI4 Full Burst Transaction으로 메모리 간 데이터를 옮기는 **DMA Con
 
 | 항목 | 내용 |
 |---|---|
+| 기간 | 2026.08.11 ~ 2026.08.30 |
 | 상태 | 일부 설계까지만 진행 |
 | 형태 | 3인 팀 |
 | 인터페이스 | AXI4 Full (ID 4-bit, ADDR 15-bit, DATA 32-bit) |
@@ -129,3 +130,11 @@ CPU와 DMA가 서로 다른 Slave에 동시에 요청하면 Slave별로 완료 �
 |---|---|---|
 | RTL | Read / Write Engine, AXI4 Interconnect | 진행 중 |
 | RTL | DMA Top, 내부 FIFO, AXI4-Lite CSR(SRC · DST · LEN · START · STATUS · IRQ) | 예정 |
+
+### 확장 구상
+
+DMA와 Interconnect를 기반으로 카메라 영상 입력부터 CNN 가속기까지 연결하는 SoC로 확장할 계획이었습니다.
+
+<p align="center">
+  <img src="docs/soc_expansion_plan.webp" alt="SoC Expansion Plan" width="100%">
+</p>
